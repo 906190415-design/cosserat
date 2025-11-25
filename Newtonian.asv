@@ -1,0 +1,290 @@
+function flag = Newtonian(routing, ls, tau_tot, save_true)
+
+    if nargin < 4
+        save_true = true;
+    end
+
+    addpath('./tools')
+
+    % independent parameters
+    [E, Gj, R_b, rho] = materials();
+    grav = [0; 0; -9.81]; % [N/kg] % gravity acceleration constant
+    [~, ~, ~, n_segments, n_tendons, l_j] = tendons(routing);
+
+    % boundary conditions
+    r0 = zeros(n_segments, 3);
+    Q0 = [rot2quat(eye(3))';
+          zeros(n_segments - 1, 4)];
+
+    % dependent parameter calculations
+    area = pi*R_b^2;
+    I = pi*R_b^4/4;
+    J = 2*I;
+    Kse = diag([Gj*area, Gj*area, E*area]);
+    Kbt = diag([E*I, E*I, Gj*J]);
+    %%
+  % 定义Const结构体（整合所有参数）
+    Const = struct( ...
+        'routing', routing, ...
+        'n_segments', n_segments, ...
+        'n_tendons', n_tendons, ...
+        'l_j', l_j, ...
+        'l_j_seg', l_j,  % 各段长度
+        'rho', rho, ...
+        'area', area, ...
+        'I', I, ...
+        'J', J, ...
+        'Kse', Kse, ...
+        'Kbt', Kbt, ...
+        'grav', grav, ...
+        'tau', tau ); % 当前载荷步的肌腱力
+    %%
+    % solve with shooting method
+        % 调用fsolve时传递Const（需通过匿名函数包装）
+    [init_guess, ~, flag] = fsolve(@(g) shooting_fun(g, Const), init_guess, opt);
+    init_guess = zeros(6, 1);
+    global Y j; % % forward declaration for future scoping rule changes
+    Y = cell(n_segments, 1);
+
+    flag = 1;
+    t = 1;
+    opt = optimoptions('fsolve', ...
+                                   'Algorithm', 'levenberg-marquardt', ...
+                                   'Display', 'off');
+    tic;
+    while flag > 0 && t <= ls
+        tau = t*tau_tot/ls;
+        [init_guess, ~, flag] = fsolve(@shooting_fun, init_guess, opt);
+        t = t + 1;
+    end
+    time = toc;
+    if flag <= 0
+        warning('solver did not exit properly');
+    else
+        % display
+        l = sum(l_j);
+        n_nodes = size(Y{1}, 1);
+        Y = cell2mat(Y)';
+        rX = Y(1:3, :);
+        plot_TACR(rX, n_segments, l, n_nodes, 'Newtonian');
+        % save
+        if save_true
+            QX = Y(4:7, :);
+            rl_j = Y(1:3, end);
+            Ql_j = Y(4:7, end);
+            xi0 = Y(8:13, 1);
+            save_TACR(routing, rl_j, Ql_j, rX, QX, xi0, time, tau, ls);
+        end
+    end
+    %%
+    function dy = TACR_ODE(X, y, Const)  % 新增Const参数传递物理常数
+        % 解包状态变量（扩展后）
+        r = y(1:3);         % 位置
+        Q = y(4:7);         % 姿态四元数
+        K = y(8:10);        % 曲率
+        G = y(11:13);       % 应变
+        dr_dt = y(14:16);   % 线速度
+        dQ_dt = y(17:20);   % 四元数一阶导数
+        
+        % 物理参数（从Const获取）
+        R = quat2rot(Q);                % 旋转矩阵
+        mass = Const.rho * Const.area * Const.l_j_seg;  % 当前段质量（段长×线密度）
+        I_tensor = diag([Const.I, Const.I, Const.J]);   % 惯性张量（已在Newtonian.m中计算）
+        
+        % 1. 计算角速度ω（从四元数一阶导数转换）
+        omega = quaternion_omega_from_q_dot(Q, dQ_dt);  % 工具函数：dQ/dt = 0.5·ω×Q → 反解ω
+        
+        % 2. 静力学载荷计算（复用原逻辑：肌腱力、重力等）
+        a = zeros(3, 1);
+        b = zeros(3, 1);
+        A = zeros(3, 3);
+        O = zeros(3, 3);
+        H = zeros(3, 3);
+        for jj = Const.j:n_segments  % Const.j为当前段索引
+            for i = 1 : Const.n_tendons(jj)
+                it = i + sum(Const.n_tendons(1:jj - 1));
+                [D, dD, ddD] = tendons(Const.routing, Const.j, it, X);
+                G_i = cross(K, D) + dD + G;
+                G_i_norm = norm(G_i);
+                A_i = -hat(G_i)^2 * (Const.tau(jj, i) / G_i_norm^3);
+                O_i = -A_i * hat(D);
+                a_i = A_i * (cross(K, G_i + dD) + ddD);
+                a = a + a_i;
+                b = b + cross(D, a_i);
+                A = A + A_i;
+                O = O + O_i;
+                H = H + hat(D) * O_i;
+            end
+        end
+        
+        % 3. 静力学合力/合力矩（原rhs）
+        N = Const.Kse*(G - [0; 0; 1]);
+        C = Const.Kbt*K;
+        static_force = -cross(K, C) - cross(G, N) - b;       % 静力合力
+        static_torque = -cross(K, N) - R.'*Const.rho*Const.area*Const.grav - a;  % 静力合力矩
+        
+        % 4. 动力学平衡方程（加入惯性项）
+        % 线加速度：静力合力 = 惯性力（mass·d_dr_dt）
+        d_dr_dt = static_force / mass;  % 线加速度 = 合力 / 质量
+        
+        % 角加速度：静力合力矩 = 惯性力矩（I·dω/dt + ω×(I·ω)）
+        inertia_coriolis = cross(omega, I_tensor * omega);  % 科氏项
+        d_omega = inv(I_tensor) * (static_torque - inertia_coriolis);  % 角加速度
+        
+        % 5. 四元数二阶导数（d_dQ_dt）：从角加速度转换
+        d_dQ_dt = 0.5 * (quaternion_dot_omega(d_omega) * Q + quaternion_dot_omega(omega) * dQ_dt);
+        
+        % 6. 状态导数打包（对应20维状态变量）
+        dr = dr_dt;                  % 线速度（r的一阶导数）
+        dQ = dQ_dt;                  % 四元数一阶导数（Q的一阶导数）
+        dxi = [Const.Mat\rhs(1:3); Const.Mat\rhs(4:6)];  % 曲率/应变导数（复用原计算）
+        dy = [dr; dQ; dxi; d_dr_dt; d_dQ_dt];  % 完整导数向量
+    end
+%%
+        Mat = [H + Kbt,     O.';
+                     O, A + Kse];
+
+        N = Kse*(G - [0; 0; 1]);
+        C = Kbt*K;
+
+        rhs = [-cross(K, C) - cross(G, N) - b;
+               -cross(K, N) - R.'*rho*area*grav - a];
+
+        % calculate ODE terms
+        dr = R*G;
+        dQ = quaternion_dot_q_omega(Q, K);
+        dxi = Mat\rhs;
+
+        % pack state vector derivative
+        dy = [dr; dQ; dxi];
+    end
+
+    function distal_error = shooting_fun(guess)
+    % " One of the unknown state variables is v(0), but we guess n(0)
+    % and solve for v(0) since I suspect this will lead to better
+    % numerical conditioning of the objective function. " - J. Till
+    % (note: here, v = G and n = N)
+    global Y j;  % 保留全局变量传递结果
+    for j = 1:Const.n_segments  % Const包含全局参数
+        if j == 1 % guess for the first segment
+            N0_j = guess(1:3);
+            G0_j = Kse\N0_j + [0; 0; 1];
+            K0_j = guess(4:6);
+            r0_j = zeros(3, 1);  % 初始线速度（可根据需求调整）
+            dQ0_j = zeros(4, 1);  % 初始四元数导数（可根据需求调整）
+            y0 = [r0(j, :)'; Q0(j, :)'; K0_j; G0_j; dr0_j; dQ0_j];  % 20维初始状态
+        else % propagation for the other segments
+            G0_j = Kse\N0_jp1 + [0; 0; 1]; % (see l. + 97)
+            K0_j = Kbt\C0_jp1;
+            dr0_j = Y{j-1}(end, 14:16)';  % 继承上一段末端线速度
+            dQ0_j = Y{j-1}(end, 17:20)';  % 继承上一段末端四元数导数
+            y0 = [r0(j, :)'; Q0(j, :)'; K0_j; G0_j; dr0_j; dQ0_j];
+        end
+        
+        op = odeset('RelTol', 1e-8, 'AbsTol', 1e-8);
+        
+        [~, Y{j}] = ode45(@(X,y) TACR_ODE(X,y,Const), linspace(0, Const.l_j(j)), y0, op);
+        % find the internal forces in the backbone prior to the final
+        % plate
+        Kl_j = Y{j}(end, 8:10).';
+        Gl_j = Y{j}(end, 11:13).';
+        drl_j = Y{j}(end, 14:16).';  % 末端线速度
+        dQl_j = Y{j}(end, 17:20).';  % 末端四元数导数
+        
+        % update the state variables for the next segment
+        if j < n_segments
+            r0(j + 1, :) = Y{j}(end, 1:3);
+            Q0(j + 1, :) = Y{j}(end, 4:7);
+        end
+        
+        Nl_j = Kse*(Gl_j - [0; 0; 1]);
+        Cl_j = Kbt*Kl_j;
+        
+        % find the equilibrium error at the tip, considering tendon
+        % forces (terminating in the current segment only)
+        for i = 1 : n_tendons(j)
+            it = i + sum(n_tendons(1:j - 1));
+            % current D
+            [D, dD] = tendons(routing, j, it, l_j(j));
+            G_i = cross(Kl_j, D) + dD + Gl_j;
+            Fb_i = -tau(j, i)*G_i/norm(G_i);
+            Nl_j = Nl_j - Fb_i;
+            Cl_j = Cl_j - cross(D, Fb_i);
+        end
+        
+        % equilibrium : tendons + bb
+        if j == Const.n_segments
+            % 末端惯性力：mass·d_dr_dt（d_dr_dt是Y{j}中d_dr_dt的末端值）
+            d_dr_lj = Y{j}(end, 14+3:16+3).';  % 末端线加速度（d_dr_dt在y中的位置）
+            inertia_force = mass * d_dr_lj;
+            % 末端惯性力矩：I·dω/dt + ω×(I·ω)（从d_omega计算）
+            omega_lj = quaternion_omega_from_q_dot(Ql_j, dQl_j);
+            inertia_torque = I_tensor * d_omega_lj + cross(omega_lj, I_tensor*omega_lj);
+            % 动力学误差 = 静力 + 惯性力/力矩（需平衡为零）
+            distal_error = [Nl_j + inertia_force; Cl_j + inertia_torque];
+        else % other segments : propagation
+            % for all tendons passing from one segment to the next one,
+            % we need to compute the force applied to the backbone due
+            % to the routing shift.
+            FtX = zeros(3, 1);
+            LtX = zeros(3, 1);
+            % calculate Kl_j_p & Gl_j_p (p -> +)
+            a = zeros(3, 1);
+            b = zeros(3, 1);
+            A = zeros(3, 3);
+            O = zeros(3, 3);
+            H = zeros(3, 3);
+            for jj = j:n_segments
+                for i = 1 : n_tendons(jj)
+                    it = i + sum(n_tendons(1:jj - 1));
+                    % current D
+                    [D, dD_j_m] = tendons(routing, j, it, l_j(j));
+                    [~, dD_j_p] = tendons(routing, j + 1, it, 0);
+                    G_i = cross(Kl_j, D) + Gl_j;
+                    G_i_norm = norm(G_i);
+                    A_i = -hat(G_i)^2*(tau(jj, i)/G_i_norm^3);
+                    O_i = -A_i * hat(D);
+                    a_i = A_i * (dD_j_p - dD_j_m);
+                    
+                    a = a + a_i;
+                    b = b + cross(D, a_i);
+                    A = A + A_i;
+                    O = O + O_i;
+                    H = H + hat(D) * O_i;
+                end
+            end
+
+                Mat = [H + Kbt,     O.';
+                             O, A + Kse];
+
+                rhs = [-b;
+                       -a];
+
+                delta_xi = -Mat\rhs;
+                Kl_j_p = Kl_j + delta_xi(1:3);
+                Gl_j_p = Gl_j + delta_xi(4:6);
+
+                for jj = j + 1:n_segments
+                    for i = 1:n_tendons(jj)
+                        it = i + sum(n_tendons(1:jj - 1));
+                        [D, dD_j_p] = tendons(routing, j + 1, it, 0);
+                        [~, dD_j_m] = tendons(routing, j, it, l_j(j));
+                        if any(dD_j_p ~= dD_j_m)
+                            G_i_p = hat(Kl_j_p)*D + dD_j_p + Gl_j_p;
+                            G_i_m = hat(Kl_j)*D + dD_j_m + Gl_j;
+                            Ci = G_i_p/norm(G_i_p) - G_i_m/norm(G_i_m);
+                            F = Ci*tau(jj, i);
+                            FtX = FtX + F;
+                            LtX = LtX + hat(D)*F;
+                        end
+                    end
+                end
+
+                % propagate the resultant internal loads to the next sect.
+                N0_jp1 = Nl_j - FtX;
+                C0_jp1 = Cl_j - LtX;
+            end
+        end
+    end
+
+end
